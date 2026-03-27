@@ -1,0 +1,72 @@
+.TH CHECK-CERT 1 "March 2026" "2.0.0" "Certificate Checker Utility"
+.SH NAME
+check-cert \- Validate SSL certificate compatibility: cert, key, intermediate, and chain.
+.SH SYNOPSIS
+.B check-cert
+[\fB\-c\fR cert_file] [\fB\-k\fR key_file] [\fB\-i\fR intermediate_file] [\fB\-b\fR chain_file]
+[\fB\-\-host\fR host:port] [\fB\-w\fR days] [\fB\-v\fR] [\fB\-j\fR] [\fB\-h\fR]
+.SH DESCRIPTION
+\fBcheck-cert\fR is a zero-dependency Bash CLI tool to verify that an SSL certificate
+matches its private key, check expiry, detect self-signed certificates, validate
+intermediate CA chain, verify full chain bundles, and optionally fetch certificates
+directly from remote hosts.
+
+.SH OPTIONS
+.TP
+.B \-c, --cert
+Path to the certificate file to validate (.pem / .crt). Required unless --host is used.
+.TP
+.B \-k, --key
+Path to the private key file. Required.
+.TP
+.B \-i, --intermediate
+Path to the intermediate certificate file (optional).
+.TP
+.B \-b, --chain
+Path to a full chain bundle file for verification (optional).
+.TP
+.B \-\-host
+Remote host and port to fetch the certificate from (e.g. example.com:443).
+.TP
+.B \-w, --warn-days
+Number of days before expiry to emit a warning. Default: 30.
+.TP
+.B \-v, --verbose
+Enable verbose mode to display detailed OpenSSL output including key hashes, SANs, and issuer info.
+.TP
+.B \-j, --json
+Output results in JSON format. Useful for CI/CD pipelines.
+.TP
+.B \-\-version
+Show version and exit.
+.TP
+.B \-h, --help
+Show help and usage information.
+
+.SH EXIT CODES
+.TP
+.B 0
+All checks passed.
+.TP
+.B 1
+Usage error or missing/invalid arguments.
+.TP
+.B 2
+One or more checks failed.
+
+.SH EXAMPLES
+check-cert -c cert.pem -k key.pem
+
+check-cert -c cert.pem -k key.pem -i intermediate.pem -v
+
+check-cert -c cert.pem -k key.pem -b fullchain.pem --warn-days 60
+
+check-cert --host example.com:443 -k key.pem
+
+check-cert -c cert.pem -k key.pem -j > result.json
+
+.SH AUTHOR
+Written by Youness OUJDID, Senior System / DevOps Engineer.
+
+.SH VERSION
+2.0.0
