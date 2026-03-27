@@ -1,0 +1,379 @@
+#!/bin/bash
+# ==============================================================================
+# check-cert — SSL Certificate Compatibility Checker
+# Author : Youness OUJDID — Senior System Engineer
+# License: MIT
+# Repo   : https://github.com/youness-oujdid/check-cert
+# ==============================================================================
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Version
+# ------------------------------------------------------------------------------
+VERSION="2.0.0"
+
+# ------------------------------------------------------------------------------
+# Color codes (disabled automatically when not a TTY)
+# ------------------------------------------------------------------------------
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' BOLD='' NC=''
+fi
+
+# ------------------------------------------------------------------------------
+# Defaults
+# ------------------------------------------------------------------------------
+VERBOSE=0
+JSON_OUTPUT=0
+WARN_DAYS=30
+ERROR_FOUND=0
+CERT_FILE=""
+KEY_FILE=""
+INTERMEDIATE_FILE=""
+CHAIN_FILE=""
+HOST=""
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+info()    { echo -e "${BLUE}ℹ${NC}  $*"; }
+ok()      { echo -e "${GREEN}✅${NC} $*"; }
+warn()    { echo -e "${YELLOW}⚠️${NC}  $*"; }
+fail()    { echo -e "${RED}❌${NC} $*"; ERROR_FOUND=1; }
+verbose() { [ "$VERBOSE" -eq 1 ] && echo -e "${BOLD}🔎${NC} $*" || true; }
+die()     { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
+
+# ------------------------------------------------------------------------------
+# Dependency check
+# ------------------------------------------------------------------------------
+check_deps() {
+    local missing=()
+    for cmd in openssl; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [ ${#missing[@]} -eq 0 ] || die "Missing required tools: ${missing[*]}"
+}
+
+# ------------------------------------------------------------------------------
+# Banner
+# ------------------------------------------------------------------------------
+show_banner() {
+    echo -e "${GREEN}"
+    echo "======================================================="
+    echo "          🔐  check-cert  v${VERSION}"
+    echo "     SSL Certificate Compatibility Checker"
+    echo "======================================================="
+    echo -e "${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Help
+# ------------------------------------------------------------------------------
+show_help() {
+    cat <<EOF
+${BOLD}Usage:${NC}
+  check-cert [OPTIONS] -c <cert> -k <key>
+
+${BOLD}Options:${NC}
+  -c, --cert          Path to the certificate file (.pem / .crt)
+  -k, --key           Path to the private key file (.pem / .key)
+  -i, --intermediate  Path to the intermediate certificate (optional)
+  -b, --chain         Path to a full chain bundle file (optional)
+      --host          Remote host to fetch and check (e.g. example.com:443)
+  -w, --warn-days     Days before expiry to show a warning (default: 30)
+  -v, --verbose       Show detailed OpenSSL output
+  -j, --json          Output results in JSON format
+      --version       Show version and exit
+  -h, --help          Show this help and exit
+
+${BOLD}Examples:${NC}
+  check-cert -c cert.pem -k key.pem
+  check-cert -c cert.pem -k key.pem -i intermediate.pem -v
+  check-cert -c cert.pem -k key.pem -b chain.pem --warn-days 60
+  check-cert --host example.com:443 -k key.pem
+  check-cert -c cert.pem -k key.pem -j > result.json
+
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Argument parsing
+# ------------------------------------------------------------------------------
+parse_args() {
+    [[ $# -eq 0 ]] && show_help && exit 0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--cert)          CERT_FILE="$2";         shift 2 ;;
+            -k|--key)           KEY_FILE="$2";          shift 2 ;;
+            -i|--intermediate)  INTERMEDIATE_FILE="$2"; shift 2 ;;
+            -b|--chain)         CHAIN_FILE="$2";        shift 2 ;;
+            --host)             HOST="$2";              shift 2 ;;
+            -w|--warn-days)     WARN_DAYS="$2";         shift 2 ;;
+            -v|--verbose)       VERBOSE=1;              shift   ;;
+            -j|--json)          JSON_OUTPUT=1;          shift   ;;
+            --version)          echo "check-cert v${VERSION}"; exit 0 ;;
+            -h|--help)          show_help; exit 0 ;;
+            *) die "Unknown option: $1. Use --help for usage." ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Validate inputs
+# ------------------------------------------------------------------------------
+validate_inputs() {
+    [[ -z "$CERT_FILE" && -z "$HOST" ]] && die "Provide -c <cert> or --host <host>."
+    [[ -z "$KEY_FILE" ]] && die "Private key file (-k) is required."
+
+    [[ -n "$CERT_FILE" && ! -f "$CERT_FILE" ]]         && die "Certificate file not found: $CERT_FILE"
+    [[ ! -f "$KEY_FILE" ]]                              && die "Key file not found: $KEY_FILE"
+    [[ -n "$INTERMEDIATE_FILE" && ! -f "$INTERMEDIATE_FILE" ]] && die "Intermediate file not found: $INTERMEDIATE_FILE"
+    [[ -n "$CHAIN_FILE" && ! -f "$CHAIN_FILE" ]]        && die "Chain file not found: $CHAIN_FILE"
+
+    if ! [[ "$WARN_DAYS" =~ ^[0-9]+$ ]]; then
+        die "--warn-days must be a positive integer."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Fetch remote certificate
+# ------------------------------------------------------------------------------
+fetch_remote_cert() {
+    local host_port="$HOST"
+    local tmpfile
+    tmpfile=$(mktemp /tmp/check-cert-remote.XXXXXX.pem)
+
+    info "Fetching certificate from ${host_port}..."
+    if ! openssl s_client -connect "$host_port" -servername "${host_port%%:*}" \
+        </dev/null 2>/dev/null | openssl x509 -out "$tmpfile" 2>/dev/null; then
+        rm -f "$tmpfile"
+        die "Could not retrieve certificate from $host_port"
+    fi
+    CERT_FILE="$tmpfile"
+    echo "$tmpfile"  # caller uses this to clean up
+}
+
+# ------------------------------------------------------------------------------
+# Check 1: Certificate validity & expiry
+# ------------------------------------------------------------------------------
+check_cert_validity() {
+    info "Checking certificate validity..."
+
+    local subject cn sans expiry_date days_left
+
+    subject=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null) || { fail "Cannot parse certificate file."; return; }
+    cn=$(echo "$subject" | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1 | cut -d',' -f1)
+    verbose "Subject: $subject"
+    verbose "CN: $cn"
+
+    # SANs
+    sans=$(openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName 2>/dev/null | grep -v "Subject Alt" || true)
+    [ -n "$sans" ] && verbose "SANs: $sans"
+
+    # Expiry
+    expiry_date=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2)
+    days_left=$(( ( $(date -d "$expiry_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry_date" +%s) - $(date +%s) ) / 86400 ))
+
+    if openssl x509 -in "$CERT_FILE" -noout -checkend 0 &>/dev/null; then
+        if [ "$days_left" -le "$WARN_DAYS" ]; then
+            warn "Certificate for '${cn}' expires in ${days_left} day(s) on ${expiry_date}."
+        else
+            ok "Certificate for '${cn}' is valid — expires on ${expiry_date} (${days_left} days left)."
+        fi
+    else
+        fail "Certificate is EXPIRED or not yet valid (expiry: ${expiry_date})."
+    fi
+
+    # Key algorithm & size
+    local algo keysize
+    algo=$(openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep "Public Key Algorithm" | awk '{print $NF}')
+    keysize=$(openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep "Public-Key:" | grep -oP '\d+')
+    verbose "Key Algorithm: ${algo}, Key Size: ${keysize} bits"
+
+    if [[ "$algo" == *"rsaEncryption"* && -n "$keysize" && "$keysize" -lt 2048 ]]; then
+        warn "RSA key size is ${keysize} bits — recommend at least 2048 bits."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Check 2: Private key validity
+# ------------------------------------------------------------------------------
+check_key_validity() {
+    info "Checking private key..."
+    if openssl pkey -in "$KEY_FILE" -noout 2>/dev/null; then
+        ok "Private key is valid."
+    else
+        fail "Private key is invalid or could not be parsed."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Check 3: Cert ↔ Key match
+# ------------------------------------------------------------------------------
+check_cert_key_match() {
+    info "Checking certificate ↔ key match..."
+
+    local cert_hash key_hash
+    cert_hash=$(openssl x509 -in "$CERT_FILE" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl sha256 | awk '{print $2}')
+    key_hash=$(openssl pkey -in "$KEY_FILE" -pubout -outform der 2>/dev/null | openssl sha256 | awk '{print $2}')
+
+    verbose "Cert public key SHA256: ${cert_hash}"
+    verbose "Key  public key SHA256: ${key_hash}"
+
+    if [[ "$cert_hash" == "$key_hash" ]]; then
+        ok "Certificate and private key match."
+    else
+        fail "Certificate and private key do NOT match."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Check 4: Self-signed detection (correctly)
+# ------------------------------------------------------------------------------
+check_self_signed() {
+    info "Checking if certificate is self-signed..."
+
+    local issuer subject
+    issuer=$(openssl x509 -in "$CERT_FILE" -noout -issuer 2>/dev/null)
+    subject=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null)
+
+    verbose "Issuer : $issuer"
+    verbose "Subject: $subject"
+
+    if [[ "$issuer" == "$subject" ]]; then
+        warn "Certificate is self-signed (issuer == subject). Not suitable for production."
+    else
+        ok "Certificate is CA-signed (issuer ≠ subject)."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Check 5: Intermediate CA match
+# ------------------------------------------------------------------------------
+check_intermediate() {
+    [[ -z "$INTERMEDIATE_FILE" ]] && return
+
+    info "Checking certificate ↔ intermediate CA chain..."
+
+    local cert_issuer inter_subject
+    cert_issuer=$(openssl x509 -in "$CERT_FILE" -noout -issuer 2>/dev/null)
+    inter_subject=$(openssl x509 -in "$INTERMEDIATE_FILE" -noout -subject 2>/dev/null)
+
+    verbose "Cert issuer     : $cert_issuer"
+    verbose "Intermediate sub: $inter_subject"
+
+    if [[ "$cert_issuer" == "$inter_subject" ]]; then
+        ok "Certificate is correctly issued by the provided intermediate CA."
+    else
+        fail "Certificate issuer does NOT match intermediate CA subject."
+        verbose "Expected: $cert_issuer"
+        verbose "Got     : $inter_subject"
+    fi
+
+    # Verify full chain signature
+    if openssl verify -CAfile "$INTERMEDIATE_FILE" "$CERT_FILE" &>/dev/null; then
+        ok "Certificate signature verified against intermediate CA."
+    else
+        fail "Certificate signature verification against intermediate CA FAILED."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Check 6: Full chain bundle
+# ------------------------------------------------------------------------------
+check_chain() {
+    [[ -z "$CHAIN_FILE" ]] && return
+
+    info "Verifying certificate against full chain bundle..."
+
+    if openssl verify -CAfile "$CHAIN_FILE" "$CERT_FILE" &>/dev/null; then
+        ok "Certificate verified against full chain bundle."
+    else
+        fail "Certificate could NOT be verified against the chain bundle."
+    fi
+
+    # Count certs in chain
+    local count
+    count=$(grep -c "BEGIN CERTIFICATE" "$CHAIN_FILE" 2>/dev/null || echo 0)
+    verbose "Chain bundle contains ${count} certificate(s)."
+}
+
+# ------------------------------------------------------------------------------
+# JSON report
+# ------------------------------------------------------------------------------
+print_json() {
+    local status="PASS"
+    [ "$ERROR_FOUND" -ne 0 ] && status="FAIL"
+
+    local expiry_date cn
+    expiry_date=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2 || echo "unknown")
+    cn=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1 | cut -d',' -f1 || echo "unknown")
+
+    cat <<EOF
+{
+  "check_cert": {
+    "version": "${VERSION}",
+    "status": "${status}",
+    "cert_file": "${CERT_FILE}",
+    "key_file": "${KEY_FILE}",
+    "cn": "${cn}",
+    "expiry": "${expiry_date}",
+    "intermediate": "${INTERMEDIATE_FILE:-null}",
+    "chain": "${CHAIN_FILE:-null}",
+    "errors_found": ${ERROR_FOUND}
+  }
+}
+EOF
+}
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+main() {
+    check_deps
+    parse_args "$@"
+    validate_inputs
+
+    local remote_tmp=""
+    if [[ -n "$HOST" ]]; then
+        remote_tmp=$(fetch_remote_cert)
+    fi
+
+    [ "$JSON_OUTPUT" -eq 0 ] && show_banner
+
+    check_cert_validity
+    check_key_validity
+    check_cert_key_match
+    check_self_signed
+    check_intermediate
+    check_chain
+
+    echo ""
+    echo "======================================================="
+    if [ "$ERROR_FOUND" -eq 0 ]; then
+        echo -e "${GREEN}${BOLD}✅ All checks passed successfully!${NC}"
+        EXIT_CODE=0
+    else
+        echo -e "${RED}${BOLD}❌ Some checks failed. Review the output above.${NC}"
+        EXIT_CODE=2
+    fi
+    echo "======================================================="
+
+    # Cleanup remote temp file
+    [[ -n "$remote_tmp" ]] && rm -f "$remote_tmp"
+
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        print_json
+    fi
+
+    exit "$EXIT_CODE"
+}
+
+main "$@"
